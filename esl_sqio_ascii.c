@@ -84,6 +84,7 @@ static int  loadmem  (ESL_SQFILE *sqfp);
 static int  loadbuf  (ESL_SQFILE *sqfp);
 static int  nextchar (ESL_SQFILE *sqfp, char *ret_c);
 static int  seebuf   (ESL_SQFILE *sqfp, int64_t maxn, int64_t *opt_nres, int64_t *opt_endpos);
+static int  seeaddbuf(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t *ret_nres, int64_t *ret_endpos);
 static void addbuf   (ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t nres);
 static void skipbuf  (ESL_SQFILE *sqfp, int64_t nskip);
 static int  read_nres(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t nskip, int64_t nres, int64_t *opt_actual_nres);
@@ -807,9 +808,13 @@ sqascii_Read(ESL_SQFILE *sqfp, ESL_SQ *sq)
   if ((status = ascii->parse_header(sqfp, sq)) != eslOK) return status; /* EMEM, EOF, EFORMAT */
 
   do {
-    if ((status = seebuf(sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
-    if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
-    addbuf(sqfp, sq, n);
+    if ((status = seeaddbuf(sqfp, sq, &n, &epos)) == eslENORESULT)
+      {
+        if ((status = seebuf(sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
+        if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
+        addbuf(sqfp, sq, n);
+      }
+    else if (status == eslEFORMAT || status == eslEMEM) return status;
     ascii->L   += n;
     sq->eoff   = ascii->boff + epos - 1;
     if (status == eslEOD)     break;
@@ -1007,9 +1012,13 @@ sqascii_ReadSequence(ESL_SQFILE *sqfp, ESL_SQ *sq)
   if ((status = ascii->skip_header(sqfp, sq)) != eslOK) return status; /* EOF, EFORMAT */
 
   do {
-    if ((status = seebuf(sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
-    if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
-    addbuf(sqfp, sq, n);
+    if ((status = seeaddbuf(sqfp, sq, &n, &epos)) == eslENORESULT)
+      {
+        if ((status = seebuf(sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
+        if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
+        addbuf(sqfp, sq, n);
+      }
+    else if (status == eslEFORMAT || status == eslEMEM) return status;
     ascii->L   += n;
     sq->eoff   = ascii->boff + epos - 1;
     if (status == eslEOD)     break;
@@ -2331,6 +2340,133 @@ seebuf(ESL_SQFILE *sqfp, int64_t maxn, int64_t *opt_nres, int64_t *opt_endpos)
   return status;
 }
 
+/* eol_bookkeeping()
+ * seebuf()'s line and residues/bytes-per-line bookkeeping at an end of
+ * line at <bpos>, for seeaddbuf(): <*lasteol> is the previous end of line
+ * (or the scan's start - 1), <nres> the residues seen so far in this
+ * scan, of which <*nres2> are already counted in earlier lines.
+ */
+static inline void
+eol_bookkeeping(ESL_SQASCII_DATA *ascii, int bpos, int *lasteol, int64_t nres, int64_t *nres2)
+{
+  if (ascii->curbpl != -1) ascii->curbpl += bpos - *lasteol;
+  if (ascii->currpl != -1) ascii->currpl += nres - *nres2;
+  *nres2 = nres;
+
+  if (ascii->rpl != 0 && ascii->prvrpl != -1) {
+    if      (ascii->rpl    == -1)         ascii->rpl = ascii->prvrpl;
+    else if (ascii->prvrpl != ascii->rpl) ascii->rpl = 0;
+    else if (ascii->currpl  > ascii->rpl) ascii->rpl = 0;
+  }
+  if (ascii->bpl != 0 && ascii->prvbpl != -1) {
+    if      (ascii->bpl    == -1)         ascii->bpl = ascii->prvbpl;
+    else if (ascii->prvbpl != ascii->bpl) ascii->bpl = 0;
+    else if (ascii->curbpl  > ascii->bpl) ascii->bpl = 0;
+  }
+
+  ascii->prvbpl = ascii->curbpl;
+  ascii->prvrpl = ascii->currpl;
+  ascii->curbpl = 0;
+  ascii->currpl = 0;
+  *lasteol      = bpos;
+  if (ascii->linenumber != -1) ascii->linenumber++;
+}
+
+/* seeaddbuf()
+ * seebuf() and addbuf() in one pass, for the parsers that read a whole
+ * record into <sq> (Read(), ReadSequence(), esl_sqascii_Parse()):
+ * validate the buffer from <sqfp->bpos> to the end of the buffer or of
+ * the record, with seebuf()'s line and residues/bytes-per-line
+ * bookkeeping, and append its residues to <sq> as addbuf() would,
+ * growing <sq> as needed.
+ *
+ * Returns what seebuf(sqfp, -1, ...) returns: <eslOK>, <eslEOD> or
+ * <eslEFORMAT>, with the same <*ret_nres>, <*ret_endpos>, error message
+ * and bookkeeping; on <eslEFORMAT>, <sq->n> is unchanged. Unlike addbuf(),
+ * it leaves <sqfp->bpos> alone: the callers reposition it (EOD) or load
+ * the next buffer. <eslEMEM> on allocation failure.
+ *
+ * Returns <eslENORESULT>, with nothing changed, where it can't stand in
+ * for seebuf() + addbuf(): in formats with line-based input, or with a
+ * record end other than '>' (it finds lines and records with memchr());
+ * and when <sq> would store some byte that seebuf() counts as a residue
+ * as a non-residue, or the reverse (the sequence's alphabet doesn't
+ * match the file's input map), where addbuf() falls out of step with
+ * seebuf(). Callers then use those two.
+ */
+static int
+seeaddbuf(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t *ret_nres, int64_t *ret_endpos)
+{
+  ESL_SQASCII_DATA *ascii  = &sqfp->data.ascii;
+  const ESL_DSQ    *inmap  = sqfp->inmap;
+  const ESL_DSQ    *outmap = (sq->dsq != NULL ? sq->abc->inmap : sqfp->inmap);  /* as addbuf() */
+  const char       *buf    = ascii->buf;
+  const char       *p;
+  int               nc      = ascii->nc;
+  int               bpos    = ascii->bpos;
+  int               lasteol = ascii->bpos - 1;
+  int               end, eol, i, c;
+  int64_t           nres    = 0;
+  int64_t           nres2   = 0;
+  ESL_DSQ          *out;
+  ESL_DSQ           x, y;
+  int               status  = eslOK;
+  /* bookkeeping on entry, restored if we hand over to seebuf() + addbuf() */
+  int64_t           linenumber = ascii->linenumber;
+  int               rpl    = ascii->rpl,    bpl    = ascii->bpl;
+  int               currpl = ascii->currpl, curbpl = ascii->curbpl;
+  int               prvrpl = ascii->prvrpl, prvbpl = ascii->prvbpl;
+
+  if (ascii->is_linebased || inmap['>'] != eslDSQ_EOD || inmap['\n'] != eslDSQ_EOL || outmap['\n'] <= 127) return eslENORESULT;
+
+  /* The record's data in this buffer end at the first '>', if not before. */
+  p   = memchr(buf + bpos, '>', nc - bpos);
+  end = (p != NULL ? p - buf : nc);
+  if (esl_sq_GrowTo(sq, sq->n + (end - bpos)) != eslOK) return eslEMEM;
+  out = (sq->dsq != NULL ? sq->dsq + sq->n + 1 : (ESL_DSQ *) sq->seq + sq->n);
+
+  while (bpos < end)
+    {
+      p   = memchr(buf + bpos, '\n', end - bpos);
+      eol = (p != NULL ? p - buf : end);
+      for (i = bpos; i < eol; i++)
+        {
+          c = (unsigned char) buf[i];
+          if (c > 127) ESL_FAIL(eslEFORMAT, ascii->errbuf, "Line %" PRId64 ": non-ASCII character %c in sequence", ascii->linenumber, buf[i]);
+          x = inmap[c];
+          if (x <= 127)
+            {
+              if ((y = outmap[c]) > 127) goto HANDOVER;
+              out[nres++] = y;
+            }
+          else if (x == eslDSQ_IGNORED) { if (outmap[c] <= 127) goto HANDOVER; }
+          else if (x == eslDSQ_EOL)     { if (outmap[c] <= 127) goto HANDOVER; eol_bookkeeping(ascii, i, &lasteol, nres, &nres2); }
+          else if (x == eslDSQ_ILLEGAL) ESL_FAIL(eslEFORMAT, ascii->errbuf, "Line %" PRId64 ": illegal character %c", ascii->linenumber, buf[i]);
+          else if (x == eslDSQ_EOD)     { bpos = i; status = eslEOD; goto DONE; }
+          else                          ESL_FAIL(eslEFORMAT, ascii->errbuf, "inmap corruption?");
+        }
+      if (eol == end) { bpos = end; break; }
+      eol_bookkeeping(ascii, eol, &lasteol, nres, &nres2);
+      bpos = eol + 1;
+    }
+  if (end < nc) status = eslEOD;     /* stopped at the '>' */
+
+ DONE:
+  if (ascii->curbpl != -1) ascii->curbpl += bpos - lasteol - 1;
+  if (ascii->currpl != -1) ascii->currpl += nres - nres2;
+  sq->n      += nres;
+  *ret_nres   = nres;
+  *ret_endpos = bpos;
+  return status;
+
+ HANDOVER:
+  ascii->linenumber = linenumber;
+  ascii->rpl        = rpl;    ascii->bpl    = bpl;
+  ascii->currpl     = currpl; ascii->curbpl = curbpl;
+  ascii->prvrpl     = prvrpl; ascii->prvbpl = prvbpl;
+  return eslENORESULT;
+}
+
 /* addbuf() 
  * Add <nres> residues from the current buffer <sqfp->buf> to <sq>.
  * This is designed to work when we're constructing a complete
@@ -3362,9 +3498,13 @@ esl_sqascii_Parse(char *buf, int size, ESL_SQ *sq, int format)
   if ((status = ascii->parse_header(&sqfp, sq)) != eslOK) return status; /* EOF, EFORMAT */
 
   do {
-    if ((status = seebuf(&sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
-    if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
-    addbuf(&sqfp, sq, n);
+    if ((status = seeaddbuf(&sqfp, sq, &n, &epos)) == eslENORESULT)
+      {
+        if ((status = seebuf(&sqfp, -1, &n, &epos)) == eslEFORMAT) return status;
+        if (esl_sq_GrowTo(sq, sq->n + n) != eslOK) return eslEMEM;
+        addbuf(&sqfp, sq, n);
+      }
+    else if (status == eslEFORMAT || status == eslEMEM) return status;
     ascii->L   += n;
     sq->eoff   = ascii->boff + epos - 1;
     if (status == eslEOD)     break;
@@ -4410,6 +4550,53 @@ utest_edgecases(ESL_RANDOMNESS *rng, ESL_ALPHABET **abc)
   free(tb.s);
 }
 
+/* A sequence alphabet that disagrees with the file's input map: tab is
+ * a residue of the alphabet, while FASTA's input map ignores it. Then
+ * addbuf() stores tabs that seebuf() didn't count and stops short of the
+ * buffer's last residues, so which residues get lost depends on where
+ * reads end. seeaddbuf() must hand such records over to seebuf() and
+ * addbuf(); at the reference's read size the results must be identical.
+ */
+static void
+utest_mismatched_alphabet(ESL_RANDOMNESS *rng)
+{
+  ESL_ALPHABET *abc = esl_alphabet_CreateCustom("ACGT\t-N*~", 5, 9);
+  TBUF          tb  = { NULL, 0, 0 };
+  char          file[300];
+  int           i, j, k, L, nseq;
+
+  for (i = 0; i < 10; i++)
+    {
+      tb.n = 0;
+      nseq = 1 + esl_rnd_Roll(rng, 5);
+      for (j = 0; j < nseq; j++)
+        {
+          char hdr[32];
+          snprintf(hdr, 32, ">seq%d desc\n", j);
+          tb_puts(&tb, hdr);
+          L = rlen(rng, 300);
+          for (k = 0; k < L; k++)
+            {
+              if (k >= 120 && coin(rng, 0.02)) tb_putc(&tb, '\t');   /* after two lines: undoing their bookkeeping matters */
+              if (coin(rng, 0.02)) tb_putc(&tb, ' ');
+              tb_putc(&tb, pick(rng, "ACGTN*"));
+              if ((k + 1) % 60 == 0) tb_putc(&tb, '\n');
+            }
+          tb_putc(&tb, '\n');
+        }
+      write_tmpfile(&tb, file);
+      sqascii_readsize = eslREADBUFSIZE;
+      utest_read(file, eslSQFILE_FASTA, abc, 0);
+      utest_read(file, eslSQFILE_FASTA, abc, 2);
+      utest_readblock(rng, file, eslSQFILE_FASTA, abc);
+      sqascii_readsize = SQASCII_FILE_READSIZE;
+      utest_parse(file, tb.s, tb.n, eslSQFILE_FASTA, abc);
+      remove(file);
+    }
+  free(tb.s);
+  esl_alphabet_Destroy(abc);
+}
+
 /* gzip_copy(): <file>.gz next to <file>; FALSE if gzip isn't available */
 static int
 gzip_copy(const char *file, char *gzfile)
@@ -4473,6 +4660,7 @@ main(int argc, char **argv)
     }
 
   utest_edgecases(rng, abc);
+  utest_mismatched_alphabet(rng);
 
   /* Random files: FASTA (messy and clean), hmmpgmd, EMBL, GenBank; each
    * read by every test at the default read size and at a random other
