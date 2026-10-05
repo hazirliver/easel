@@ -71,6 +71,7 @@
 1 exercise scorematrix-utest  @esl_scorematrix_utest@
 1 exercise sq-utest           @esl_sq_utest@
 1 exercise sqio-utest         @esl_sqio_utest@
+1 exercise sqio-ascii-utest   @esl_sqio_ascii_utest@ !formats/fasta! !formats/fasta.2! !formats/fasta.bad.1! !formats/fasta.bad.2! !formats/fasta.bad.3! !formats/fasta.odd.1! !formats/embl! !formats/uniprot! !formats/genbank! !formats/genbank.2! !formats/genbank.bad.1!
 1 exercise sse-utest          @esl_sse_utest@
 1 exercise ssi-utest          @esl_ssi_utest@
 1 exercise stack-utest        @esl_stack_utest@
@@ -192,6 +193,7 @@
 3 valgrind scorematrix-utest  @esl_scorematrix_utest@
 3 valgrind sq-utest           @esl_sq_utest@
 3 valgrind sqio-utest         @esl_sqio_utest@
+3 valgrind sqio-ascii-utest   @esl_sqio_ascii_utest@
 3 valgrind sse-utest          @esl_sse_utest@
 3 valgrind ssi-utest          @esl_ssi_utest@
 3 valgrind stack-utest        @esl_stack_utest@

@@ -337,6 +337,7 @@ UTESTS =\
 	esl_scorematrix_utest\
 	esl_sq_utest\
 	esl_sqio_utest\
+	esl_sqio_ascii_utest\
 	esl_ssi_utest\
 	esl_stack_utest\
 	esl_stats_utest\
