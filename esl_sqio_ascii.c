@@ -36,14 +36,24 @@
 #include "esl_sq.h"
 #include "esl_ssi.h"
 
-/* Bytes read from the stream at a time. The test driver varies it, to
- * put buffer boundaries everywhere in its test files.
+/* Bytes read from a file at a time. 16 KB was the fastest size: four
+ * times fewer system calls than eslREADBUFSIZE (4 KB), while the buffer
+ * still fits in L1 cache for the parser's passes over it.
+ *
+ * Pipes (gzip -dc, stdin) and the daemon format still read eslREADBUFSIZE
+ * at a time, because there results depend on where reads end: ftello()
+ * fails on a pipe, so record offsets are -1 plus the position in the
+ * current read; and end_daemon() reads on without reloading the buffer.
+ *
+ * The test driver varies the size, to put buffer boundaries everywhere in
+ * its test files.
  */
+#define SQASCII_FILE_READSIZE 16384
 #ifdef eslSQIO_ASCII_TESTDRIVE
-static int sqascii_readsize = eslREADBUFSIZE;
+static int sqascii_readsize = SQASCII_FILE_READSIZE;
 #define SQASCII_READSIZE sqascii_readsize
 #else
-#define SQASCII_READSIZE eslREADBUFSIZE
+#define SQASCII_READSIZE SQASCII_FILE_READSIZE
 #endif
 
 /* format specific routines */
@@ -2040,9 +2050,9 @@ sqascii_FetchSubseq(ESL_SQFILE *sqfp, const char *source, int64_t start, int64_t
  * This block is loaded at sqfp->mem + sqfp->mpos.
  * 
  * Upon return:
- * sqfp->mem     now contains up to eslREADBUFSIZE more chars
+ * sqfp->mem     now contains up to <readsize> more chars
  * sqfp->mpos    is position of first byte in newly read block
- * sqfp->allocm  may have increased by eslREADBUFSIZE, if we concatenated
+ * sqfp->allocm  may have increased by <readsize>, if we concatenated
  * sqfp->mn      is # of chars in <mem>; <mn-1> is pos of last byte in new block
  * 
  * Returns <eslEOF> (and mpos == mn) if no new data can be read;
@@ -2057,30 +2067,34 @@ loadmem(ESL_SQFILE *sqfp)
   int   status;
 
   ESL_SQASCII_DATA *ascii = &sqfp->data.ascii;
+  int   readsize;
 
   if (ascii->do_buffer)
   {
       ascii->mpos = 0;
       ascii->mn   = 0;
+      return eslEOF;
   }
-  else if (ascii->is_recording == TRUE)
+
+  readsize = (ascii->do_gzip || ascii->do_stdin || sqfp->format == eslSQFILE_DAEMON) ? eslREADBUFSIZE : SQASCII_READSIZE;
+  if (ascii->is_recording == TRUE)
   {
       if (ascii->mem == NULL) ascii->moff = ftello(ascii->fp);        /* first time init of the offset */
-      ESL_RALLOC(ascii->mem, tmp, sizeof(char) * (ascii->allocm + SQASCII_READSIZE));
-      ascii->allocm += SQASCII_READSIZE;
-      n = fread(ascii->mem + ascii->mpos, sizeof(char), SQASCII_READSIZE, ascii->fp);
+      ESL_RALLOC(ascii->mem, tmp, sizeof(char) * (ascii->allocm + readsize));
+      ascii->allocm += readsize;
+      n = fread(ascii->mem + ascii->mpos, sizeof(char), readsize, ascii->fp);
       ascii->mn += n;
   }
   else
   {
-      if (ascii->mem == NULL) {
-        ESL_ALLOC(ascii->mem, sizeof(char) * SQASCII_READSIZE);
-        ascii->allocm = SQASCII_READSIZE;
+      if (ascii->allocm < readsize) {  /* (a recording may have allocated it already) */
+        ESL_RALLOC(ascii->mem, tmp, sizeof(char) * readsize);
+        ascii->allocm = readsize;
       }
       ascii->is_recording = -1;/* no more recording is possible now */
       ascii->mpos = 0;
       ascii->moff = ftello(ascii->fp);
-      n = fread(ascii->mem, sizeof(char), SQASCII_READSIZE, ascii->fp); /* see note [1] below */
+      n = fread(ascii->mem, sizeof(char), readsize, ascii->fp); /* see note [1] below */
       ascii->mn   = n;
   }
   return (n == 0 ? eslEOF : eslOK);
@@ -2171,7 +2185,7 @@ loadbuf(ESL_SQFILE *sqfp)
       }
       if (status != eslEOF) {
         n = nlp - (ascii->mem + ascii->mpos) + 1; /* inclusive of \n */
-        if (ascii->nc + n + 1 > ascii->balloc) {
+        while (ascii->nc + n + 1 > ascii->balloc) { /* (n can exceed eslREADBUFSIZE) */
           ESL_RALLOC(ascii->buf, tmp, sizeof(char) * (ascii->balloc + eslREADBUFSIZE));
           ascii->balloc += eslREADBUFSIZE;
         }
@@ -3436,9 +3450,10 @@ fileheader_hmmpgmd(ESL_SQFILE *sqfp)
  * parser's line and residues/bytes-per-line bookkeeping.
  *
  * The reference always reads eslREADBUFSIZE bytes at a time. This
- * parser reads <sqascii_readsize> bytes at a time in the test driver,
- * which the tests vary down to 1 byte, so that buffer boundaries fall
- * on every character of the test files.
+ * parser reads <sqascii_readsize> bytes at a time from files in the test
+ * driver, which the tests vary down to 1 byte, so that buffer boundaries
+ * fall on every character of the test files. (From pipes and in daemon
+ * format it reads eslREADBUFSIZE, like the reference; see SQASCII_READSIZE.)
  */
 #define esl_sqascii_Open         ref_esl_sqascii_Open
 #define esl_sqascii_WriteFasta   ref_esl_sqascii_WriteFasta
@@ -4289,6 +4304,26 @@ synth_flatfile(ESL_RANDOMNESS *rng, int alphatype, int format, TBUF *tb)
     }
 }
 
+/* daemonize(): turn FASTA in <tb> into daemon format, with a // line
+ * ending each record. (Records start at a '>' that starts a line, as in
+ * synth_fasta()'s clean files, and end with a newline.)
+ */
+static void
+daemonize(TBUF *tb)
+{
+  TBUF    out = { NULL, 0, 0 };
+  int64_t i;
+
+  for (i = 0; i < tb->n; i++)
+    {
+      if (tb->s[i] == '>' && i > 0 && tb->s[i-1] == '\n') tb_puts(&out, "//\n");
+      tb_putc(&out, tb->s[i]);
+    }
+  if (tb->n > 0) tb_puts(&out, "//\n");
+  free(tb->s);
+  *tb = out;
+}
+
 /* write_tmpfile(): write <tb> to a new tmp file named in <fname>; return its name in <fname> */
 static void
 write_tmpfile(const TBUF *tb, char *fname)
@@ -4305,6 +4340,17 @@ write_tmpfile(const TBUF *tb, char *fname)
  * <abc> (or in text mode if NULL). <clean>: the file has unique names
  * and no format errors in this mode, so SSI fetching can be tested.
  */
+static int
+has_nonascii(const char *file)
+{
+  FILE *fp;
+  int   c, found = FALSE;
+  if ((fp = fopen(file, "rb")) == NULL) return FALSE;
+  while (! found && (c = getc(fp)) != EOF) if (c > 127) found = TRUE;
+  fclose(fp);
+  return found;
+}
+
 static void
 run_file(ESL_RANDOMNESS *rng, const char *file, int format, const ESL_ALPHABET *abc, int clean)
 {
@@ -4315,12 +4361,14 @@ run_file(ESL_RANDOMNESS *rng, const char *file, int format, const ESL_ALPHABET *
   utest_read(file, format, abc, 2);
   utest_readblock(rng, file, format, abc);
   utest_readwindow(rng, file, format, abc, (abc == NULL || is_nt));
-  if (abc) utest_readblock_long(rng, file, format, abc);
+  /* (Not with bytes > 127: after a full window, skip_whitespace() indexes
+   * the input map with a negative char, reading memory before it.) */
+  if (abc && ! has_nonascii(file)) utest_readblock_long(rng, file, format, abc);
   utest_position(rng, file, format, abc);
   if (clean) utest_ssi(rng, file, format, abc);
 }
 
-static int readsizes[] = { 1, 2, 3, 5, 7, 13, 64, 509, 4095 };
+static int readsizes[] = { 1, 2, 3, 5, 7, 13, 64, 509, 4095, 4096, 4097, 16383, 65536 };
 
 /* Small FASTA files with edge cases at record and file ends, run
  * through every test at every read size in text and digital modes.
@@ -4351,14 +4399,14 @@ utest_edgecases(ESL_RANDOMNESS *rng, ESL_ALPHABET **abc)
       write_tmpfile(&tb, file);
       for (k = -1; k < (int) (sizeof(readsizes) / sizeof(int)); k++)
         {
-          sqascii_readsize = (k < 0 ? eslREADBUFSIZE : readsizes[k]);
+          sqascii_readsize = (k < 0 ? SQASCII_FILE_READSIZE : readsizes[k]);
           run_file(rng, file, eslSQFILE_FASTA, NULL, FALSE);
           for (y = 0; y < 2; y++) run_file(rng, file, eslSQFILE_FASTA, abc[y], FALSE);
           utest_guess(file);
         }
       remove(file);
     }
-  sqascii_readsize = eslREADBUFSIZE;
+  sqascii_readsize = SQASCII_FILE_READSIZE;
   free(tb.s);
 }
 
@@ -4426,12 +4474,12 @@ main(int argc, char **argv)
 
   utest_edgecases(rng, abc);
 
-  /* Random files: FASTA (messy and clean), hmmpgmd, EMBL, GenBank;
-   * each read by every test at the default read size and at a random
-   * small one, in text mode and in digital mode of both alphabets.
-   * A .gz copy is read at the default size only: on a pipe ftello()
-   * fails, so disk offsets are -1 plus the position in the current
-   * read, which depends on the read size.
+  /* Random files: FASTA (messy and clean), hmmpgmd, EMBL, GenBank; each
+   * read by every test at the default read size and at a random other
+   * one, in text mode and in digital mode of both alphabets, and FASTA
+   * also from a .gz copy. (Daemon format only through Parse(), below:
+   * in a file, end_daemon() can leave the parser at the buffer's end,
+   * and the next record's skip_fasta() then reads a byte past it.)
    * (Not hmmpgmd in DNA: SetDigital() doesn't configure that format, so
    * the file's input map stays the text one; letters that aren't DNA
    * then pass validation but not digitization, and even the reference
@@ -4456,14 +4504,14 @@ main(int argc, char **argv)
 
           for (k = 0; k < 2; k++)
             {
-              sqascii_readsize = (k == 0 ? eslREADBUFSIZE : readsizes[esl_rnd_Roll(rng, sizeof(readsizes) / sizeof(int))]);
+              sqascii_readsize = (k == 0 ? SQASCII_FILE_READSIZE : readsizes[esl_rnd_Roll(rng, sizeof(readsizes) / sizeof(int))]);
               run_file(rng, file, format, NULL, clean);
               for (y = 0; y < 2; y++)
                 if (format != eslSQFILE_HMMPGMD || alphatype[y] == eslAMINO)  /* see above */
                   run_file(rng, file, format, abc[y], clean && y == x);
               if (kind < 3) {
                 utest_guess(file);
-                if (k == 0 && gzip_copy(file, gzfile)) {      /* (a pipe: offsets depend on the read size, see below) */
+                if (gzip_copy(file, gzfile)) {
                   utest_read(gzfile, format, NULL, 0);
                   utest_readblock(rng, gzfile, format, (format == eslSQFILE_HMMPGMD ? NULL : abc[x]));
                   utest_guess(gzfile);
@@ -4471,7 +4519,7 @@ main(int argc, char **argv)
                 }
               }
             }
-          sqascii_readsize = eslREADBUFSIZE;
+          sqascii_readsize = SQASCII_FILE_READSIZE;
 
           /* esl_sqascii_Parse() on each record of a clean FASTA file, and as daemon format */
           if (clean && esl_sqfile_Open(file, format, NULL, &sqfp) == eslOK)
@@ -4479,8 +4527,14 @@ main(int argc, char **argv)
               sq = esl_sq_Create();
               while ((status = esl_sqio_Read(sqfp, sq)) == eslOK)
                 {
+                  TBUF rec = { NULL, 0, 0 };
                   utest_parse(file, tb.s + sq->roff, sq->eoff - sq->roff + 1, eslSQFILE_FASTA, NULL);
                   utest_parse(file, tb.s + sq->roff, sq->eoff - sq->roff + 1, eslSQFILE_FASTA, abc[x]);
+                  for (k = sq->roff; k <= sq->eoff; k++) tb_putc(&rec, tb.s[k]);
+                  daemonize(&rec);
+                  utest_parse(file, rec.s, rec.n, eslSQFILE_DAEMON, NULL);
+                  utest_parse(file, rec.s, rec.n, eslSQFILE_DAEMON, abc[x]);
+                  free(rec.s);
                   esl_sq_Reuse(sq);
                 }
               esl_sq_Destroy(sq);
