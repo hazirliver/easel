@@ -4320,18 +4320,58 @@ run_file(ESL_RANDOMNESS *rng, const char *file, int format, const ESL_ALPHABET *
   if (clean) utest_ssi(rng, file, format, abc);
 }
 
+static int readsizes[] = { 1, 2, 3, 5, 7, 13, 64, 509, 4095 };
+
+/* Small FASTA files with edge cases at record and file ends, run
+ * through every test at every read size in text and digital modes.
+ */
+static void
+utest_edgecases(ESL_RANDOMNESS *rng, ESL_ALPHABET **abc)
+{
+  static const char *cases[] = {
+    ">seq1",                       ">seq1 desc",                    ">seq1\n",
+    ">seq1\nACGT",                 ">seq1\nACGT\n>",                ">seq1\nACGT\n>seq2",
+    ">seq1\r\nAC\r\nGT\r\n>seq2 d\r\n\r\n",                         "\n\n  >seq1\nAC\n",
+    "   \n\t\n",                   "",                              ">a\n>b\n>c\n",
+    ">a\001junk\nACGT\n",          ">a\nAC GT\tAC\rGT\n",           "x>a\nAC\n",
+    ">a\nAC9GT\n",                  ">a\nAC\200GT\n",                ">\nACGT\n",
+    "> \t a b\n",                  ">a\nACGT>b\nTT\n",              ">a\rAC\rGT\r>b\r",
+    ">a\n\n\nACGT\n\n>b\nA\n",     ">a\nACGT\n  \n",                ">a b\n*ACGT*\nacgt\n",
+  };
+  int    ncases = sizeof(cases) / sizeof(char *);
+  TBUF   tb     = { NULL, 0, 0 };
+  char   file[300];
+  int    i, j, k, y;
+
+  for (i = 0; i <= ncases; i++)
+    {
+      tb.n = 0;
+      if (i < ncases) tb_puts(&tb, cases[i]);
+      else { tb_puts(&tb, ">"); for (j = 0; j < 10000; j++) tb_putc(&tb, 'a' + j % 26); }  /* long name at EOF */
+      write_tmpfile(&tb, file);
+      for (k = -1; k < (int) (sizeof(readsizes) / sizeof(int)); k++)
+        {
+          sqascii_readsize = (k < 0 ? eslREADBUFSIZE : readsizes[k]);
+          run_file(rng, file, eslSQFILE_FASTA, NULL, FALSE);
+          for (y = 0; y < 2; y++) run_file(rng, file, eslSQFILE_FASTA, abc[y], FALSE);
+          utest_guess(file);
+        }
+      remove(file);
+    }
+  sqascii_readsize = eslREADBUFSIZE;
+  free(tb.s);
+}
+
 /* gzip_copy(): <file>.gz next to <file>; FALSE if gzip isn't available */
 static int
 gzip_copy(const char *file, char *gzfile)
 {
-  char cmd[600];
-  snprintf(gzfile, 300, "%s.gz", file);
-  snprintf(cmd, 600, "gzip -c %s > %s 2>/dev/null", file, gzfile);
+  char cmd[700];
+  snprintf(gzfile, 300, "%.290s.gz", file);
+  snprintf(cmd, 700, "gzip -c %.290s > %.290s 2>/dev/null", file, gzfile);
   if (system(cmd) != 0) { remove(gzfile); return FALSE; }
   return TRUE;
 }
-
-static int readsizes[] = { 1, 2, 3, 5, 7, 13, 64, 509, 4095 };
 
 static ESL_OPTIONS options[] = {
   /* name           type      default  env  range toggles reqs incomp  help                                       docgroup*/
@@ -4383,6 +4423,8 @@ main(int argc, char **argv)
       if (gabc) run_file(rng, f, eslSQFILE_UNKNOWN, gabc, FALSE);
       esl_alphabet_Destroy(gabc);
     }
+
+  utest_edgecases(rng, abc);
 
   /* Random files: FASTA (messy and clean), hmmpgmd, EMBL, GenBank;
    * each read by every test at the default read size and at a random
