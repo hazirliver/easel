@@ -3166,12 +3166,94 @@ inmap_fasta(ESL_SQFILE *sqfp, const ESL_DSQ *abc_inmap)
  *    
  * May also throw <eslEMEM> on allocation errors.
  */
+/* header_run()
+ * For header_fasta(): from the current character <*c> (at <bpos>), go
+ * over the run of characters in class <cls>, as
+ *     while (status == eslOK && in_class(*c)) status = nextchar(sqfp, c);
+ * would, but scanning within the buffer and calling nextchar() only to
+ * cross into the next one. If <dst> is non-NULL, the run is also stored
+ * at <(*dst)[*pos]>, which grows by doubling <*alloc> exactly as storing
+ * one character at a time does (whenever <*pos> reaches <*alloc>-1).
+ * Returns the last nextchar() status (<eslOK> if none was needed):
+ * <eslOK>, <eslEOF>, or <eslEMEM>; if growing <*dst> fails, returns
+ * <eslEMEM> with <*ret_allocfail> set (the caller returns that, while a
+ * nextchar() failure ends in a parse error, as before).
+ */
+enum { HDR_SPACE, HDR_BLANK, HDR_NAME, HDR_DESC, HDR_TOEOL, HDR_EOL };
+
+static inline int
+header_in(int cls, char c)
+{
+  switch (cls) {
+  case HDR_SPACE: return isspace(c);                            /* leading space, incl. blank lines */
+  case HDR_BLANK: return (c == '\t' || c == ' ');               /* space between '>', name, desc */
+  case HDR_NAME:  return ! isspace(c);
+  case HDR_DESC:  return (c != '\n' && c != '\r' && c != 1);    /* (^A: NCBI NR desclines) */
+  case HDR_TOEOL: return (c != '\n' && c != '\r');
+  default:        return (c == '\n' || c == '\r');              /* HDR_EOL */
+  }
+}
+
+static inline int
+header_run(ESL_SQFILE *sqfp, int cls, char *c, char **dst, int *pos, int *alloc, int *ret_allocfail)
+{
+  ESL_SQASCII_DATA *ascii  = &sqfp->data.ascii;
+  int               status = eslOK;
+  int               start, bpos, len;
+  void             *tmp;
+
+  while (status == eslOK && header_in(cls, *c))
+    {
+      start = ascii->bpos;
+      for (bpos = start + 1; bpos < ascii->nc && header_in(cls, ascii->buf[bpos]); bpos++) ;
+      if (dst)
+        {
+          len = bpos - start;
+          while (*pos + len >= *alloc - 1) { ESL_RALLOC(*dst, tmp, sizeof(char) * (*alloc) * 2); *alloc *= 2; }
+          memcpy(*dst + *pos, ascii->buf + start, len);
+          *pos += len;
+        }
+      if (bpos < ascii->nc) { ascii->bpos = bpos; *c = ascii->buf[bpos]; break; }
+      ascii->bpos = ascii->nc - 1;     /* the run reaches the buffer's end: */
+      *c          = ascii->buf[ascii->bpos];
+      status      = nextchar(sqfp, c); /*   on into the next one */
+    }
+  return status;
+
+ ERROR:
+  *ret_allocfail = TRUE;
+  return status;
+}
+
+/* header_fasta()
+ *
+ * sqfp->buf[sqfp->bpos] is sitting at the start of a FASTA record, or
+ * at a space before it (in which case we'll advance, skipping whitespace,
+ * until a > is reached).
+ * Parse the header line, storing name and description in <sq>.
+ *
+ * On success, returns <eslOK> and:
+ *    sq->name contains sequence name (and may have been reallocated, changing sq->nalloc)
+ *    sq->desc contains description line (and may have been reallocated, changing sq->dalloc)
+ *    sq->roff has been set to the record offset
+ *    sq->doff has been set to the data offset (start of sequence line)
+ *    sqfp->buf[sqfp->bpos] is sitting at the start of the seq line.
+ *    sqfp->currpl,curbpl set to 0, to start bookkeeping data line lengths
+ *
+ * If no more seqs are found in the file, returns <eslEOF>.
+ * On parse failure, return <eslEFORMAT>, leaves as mesg in ascii->errbuf.
+ *
+ * May also throw <eslEMEM> on allocation errors.
+ *
+ * The header is scanned in runs (header_run()); the result is the same
+ * as reading it one nextchar() at a time.
+ */
 static int
 header_fasta(ESL_SQFILE *sqfp, ESL_SQ *sq)
 {
   char  c;
-  int   status = eslOK;
-  void *tmp;
+  int   status   = eslOK;
+  int   allocfail = FALSE;
   int   pos;
 
   ESL_SQASCII_DATA *ascii = &sqfp->data.ascii;
@@ -3180,7 +3262,7 @@ header_fasta(ESL_SQFILE *sqfp, ESL_SQ *sq)
   if (ascii->nc == ascii->bpos && (status = loadbuf(sqfp)) != eslOK) return status;
 
   c =  ascii->buf[ascii->bpos];
-  while (status == eslOK && isspace(c)) status = nextchar(sqfp, &c); /* skip space (including \n) */
+  status = header_run(sqfp, HDR_SPACE, &c, NULL, NULL, NULL, NULL);    /* skip space (including \n) */
 
   if (status == eslEOF) return eslEOF;
 
@@ -3188,41 +3270,30 @@ header_fasta(ESL_SQFILE *sqfp, ESL_SQ *sq)
     sq->roff = ascii->boff + ascii->bpos; /* store SSI record offset */
     status = nextchar(sqfp, &c);
   } else if (c != '>') ESL_FAIL(eslEFORMAT, ascii->errbuf, "Line %" PRId64 ": unexpected char %c; expected FASTA to start with >", ascii->linenumber, c);
-  
-  while (status == eslOK && (c == '\t' || c == ' ')) status = nextchar(sqfp, &c); /* skip space */
+
+  if (status == eslOK) status = header_run(sqfp, HDR_BLANK, &c, NULL, NULL, NULL, NULL);  /* skip space */
 
   /* Store the name (space delimited) */
   pos = 0;
-  while (status == eslOK && ! isspace(c))
-  {
-      sq->name[pos++] = c;
-      if (pos == sq->nalloc-1) { ESL_RALLOC(sq->name, tmp, sq->nalloc*2); sq->nalloc*=2; }
-      status = nextchar(sqfp, &c); 
-  }
+  if (status == eslOK) status = header_run(sqfp, HDR_NAME, &c, &(sq->name), &pos, &(sq->nalloc), &allocfail);
+  if (allocfail) return status;
   if (pos == 0) ESL_FAIL(eslEFORMAT, ascii->errbuf, "Line %" PRId64 ": no FASTA name found", ascii->linenumber);
   sq->name[pos] = '\0';
-  
-  while (status == eslOK &&  (c == '\t' || c == ' ')) status = nextchar(sqfp, &c);   /* skip space */
+
+  if (status == eslOK) status = header_run(sqfp, HDR_BLANK, &c, NULL, NULL, NULL, NULL);  /* skip space */
 
   /* Store the description (end-of-line delimited) */
   /* Patched to deal with NCBI NR desclines: delimit by ctrl-A (0x01) too. [SRE:H1/82] */
   pos = 0;
-  while (status == eslOK && c != '\n' && c != '\r' && c != 1)
-  {
-      sq->desc[pos++] = c;
-      if (pos == sq->dalloc-1) { ESL_RALLOC(sq->desc, tmp, sq->dalloc*2); sq->dalloc*= 2; }
-      status = nextchar(sqfp, &c); 
-  }
+  if (status == eslOK) status = header_run(sqfp, HDR_DESC, &c, &(sq->desc), &pos, &(sq->dalloc), &allocfail);
+  if (allocfail) return status;
   sq->desc[pos] = '\0';
 
-  /* Because of the NCBI NR patch, c might be0x01 ctrl-A now; skip to eol. 
-   * (TODO: I'm worried about the efficiency of this nextchar() stuff. Revisit.)
-   */
-  while (status == eslOK && c != '\n' && c != '\r') 
-    status = nextchar(sqfp, &c);
+  /* Because of the NCBI NR patch, c might be0x01 ctrl-A now; skip to eol. */
+  if (status == eslOK) status = header_run(sqfp, HDR_TOEOL, &c, NULL, NULL, NULL, NULL);
   sq->hoff = ascii->boff + ascii->bpos;
-  
-  while (status == eslOK && (c == '\n' || c == '\r')) status = nextchar(sqfp, &c); /* skip past eol (DOS \r\n, MAC \r, UNIX \n */
+
+  if (status == eslOK) status = header_run(sqfp, HDR_EOL, &c, NULL, NULL, NULL, NULL);    /* skip past eol (DOS \r\n, MAC \r, UNIX \n */
   if (status != eslOK && status != eslEOF) ESL_FAIL(eslEFORMAT, ascii->errbuf, "Unexpected failure in parsing FASTA name/description line");
   /* Edge case: if the last sequence in the file is L=0, no residues, we are EOF now, not OK; but we'll return OK because we parsed the header line */
 
@@ -3231,11 +3302,8 @@ header_fasta(ESL_SQFILE *sqfp, ESL_SQ *sq)
   ascii->currpl = ascii->curbpl = 0;
   ascii->linenumber++;
   return eslOK;
-
- ERROR:
-  return status;/* eslEMEM, from failed realloc */
 }
-      
+
 /* skip_fasta()
  * 
  * Skip past the fasta header and position to start of the sequence line.
