@@ -74,6 +74,14 @@ typedef struct esl_sqascii_s {
   int      prvrpl;	      /* residues on previous line                  */
   int      prvbpl;	      /* bytes on previous line                     */
   ESL_SSI *ssi;		      /* open ESL_SSI index, or NULL if none        */
+
+  /* seeaddbuf()'s lookup table: for each byte, its digital code if both input
+   * maps make it a residue, else 255 (the per-character path decides). Made
+   * from copies of the two maps, which every call compares with the current ones. */
+  ESL_DSQ  seeadd_tab[256];
+  ESL_DSQ  seeadd_inmap[128];   /* sqfp->inmap it was made from               */
+  ESL_DSQ  seeadd_outmap[128];  /* ... and the output map                     */
+  int      seeadd_ok;           /* TRUE once made                             */
 } ESL_SQASCII_DATA;
 
 

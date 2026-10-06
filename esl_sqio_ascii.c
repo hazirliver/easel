@@ -209,6 +209,7 @@ esl_sqascii_Open(char *filename, int format, ESL_SQFILE *sqfp)
   ascii->currpl     = -1;
   ascii->curbpl     = -1;
   ascii->ssi        = NULL;
+  ascii->seeadd_ok  = FALSE;
 
   /* MSA formats are handled entirely by msafile module - 
    * let it  handle stdin, .gz, etc
@@ -2372,6 +2373,15 @@ eol_bookkeeping(ESL_SQASCII_DATA *ascii, int bpos, int *lasteol, int64_t nres, i
   if (ascii->linenumber != -1) ascii->linenumber++;
 }
 
+/* SEEADD_SH(j): the shift that puts byte j of a uint64_t at memory offset j,
+ * for seeaddbuf()'s 8-residue stores; left undefined (8-at-a-time path off)
+ * when the compiler doesn't say the byte order. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define SEEADD_SH(j) (8 * (j))
+#elif defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define SEEADD_SH(j) (56 - 8 * (j))
+#endif
+
 /* seeaddbuf()
  * seebuf() and addbuf() in one pass, for the parsers that read a whole
  * record into <sq> (Read(), ReadSequence(), esl_sqascii_Parse()):
@@ -2410,6 +2420,7 @@ seeaddbuf(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t *ret_nres, int64_t *ret_endpos)
   int64_t           nres2   = 0;
   ESL_DSQ          *out;
   ESL_DSQ           x, y;
+  const ESL_DSQ    *tab;
   int               status  = eslOK;
   /* bookkeeping on entry, restored if we hand over to seebuf() + addbuf() */
   int64_t           linenumber = ascii->linenumber;
@@ -2418,6 +2429,17 @@ seeaddbuf(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t *ret_nres, int64_t *ret_endpos)
   int               prvrpl = ascii->prvrpl, prvbpl = ascii->prvbpl;
 
   if (ascii->is_linebased || inmap['>'] != eslDSQ_EOD || inmap['\n'] != eslDSQ_EOL || outmap['\n'] <= 127) return eslENORESULT;
+
+  /* The lookup table for the residues (see ESL_SQASCII_DATA), remade if either map changed */
+  if (! ascii->seeadd_ok || memcmp(ascii->seeadd_inmap, inmap, 128) != 0 || memcmp(ascii->seeadd_outmap, outmap, 128) != 0)
+    {
+      for (c = 0; c < 256; c++)
+        ascii->seeadd_tab[c] = (c <= 127 && inmap[c] <= 127 && outmap[c] <= 127) ? outmap[c] : 255;
+      memcpy(ascii->seeadd_inmap,  inmap,  128);
+      memcpy(ascii->seeadd_outmap, outmap, 128);
+      ascii->seeadd_ok = TRUE;
+    }
+  tab = ascii->seeadd_tab;
 
   /* The record's data in this buffer end at the first '>', if not before. */
   p   = memchr(buf + bpos, '>', nc - bpos);
@@ -2429,9 +2451,25 @@ seeaddbuf(ESL_SQFILE *sqfp, ESL_SQ *sq, int64_t *ret_nres, int64_t *ret_endpos)
     {
       p   = memchr(buf + bpos, '\n', end - bpos);
       eol = (p != NULL ? p - buf : end);
-      for (i = bpos; i < eol; i++)
+      i = bpos;
+#ifdef SEEADD_SH
+      /* Runs of residues, 8 at a time: codes are <= 127, so no 255 among 8 lookups means none has bit 7 set */
+      for ( ; i + 8 <= eol; i += 8)
+        {
+          const unsigned char *u = (const unsigned char *) buf + i;
+          uint64_t w = (uint64_t) tab[u[0]] << SEEADD_SH(0) | (uint64_t) tab[u[1]] << SEEADD_SH(1) |
+                       (uint64_t) tab[u[2]] << SEEADD_SH(2) | (uint64_t) tab[u[3]] << SEEADD_SH(3) |
+                       (uint64_t) tab[u[4]] << SEEADD_SH(4) | (uint64_t) tab[u[5]] << SEEADD_SH(5) |
+                       (uint64_t) tab[u[6]] << SEEADD_SH(6) | (uint64_t) tab[u[7]] << SEEADD_SH(7);
+          if (w & 0x8080808080808080ULL) break;
+          memcpy(out + nres, &w, 8);    /* byte j in memory is residue i+j */
+          nres += 8;
+        }
+#endif
+      for (; i < eol; i++)
         {
           c = (unsigned char) buf[i];
+          if ((y = tab[c]) != 255) { out[nres++] = y; continue; }  /* a residue in both maps: as x <= 127 below */
           if (c > 127) ESL_FAIL(eslEFORMAT, ascii->errbuf, "Line %" PRId64 ": non-ASCII character %c in sequence", ascii->linenumber, buf[i]);
           x = inmap[c];
           if (x <= 127)
@@ -4673,6 +4711,74 @@ utest_mismatched_alphabet(ESL_RANDOMNESS *rng)
   esl_alphabet_Destroy(abc);
 }
 
+/* utest_map_change()
+ * seeaddbuf() digitizes through a lookup table made from the two input
+ * maps. Callers can change a map in place between reads (for example
+ * esl_alphabet_SetEquiv() edits abc->inmap), and the table must follow.
+ * Read two records, make 'A' read as C's code in the alphabet's input
+ * map, read two more, restore it, read on; the reference parser (no
+ * table) sees the same changes.
+ */
+static void
+utest_map_change(ESL_RANDOMNESS *rng)
+{
+  ESL_ALPHABET *abc = esl_alphabet_Create(eslAMINO);
+  ESL_SQ       *a   = new_sq(abc);
+  ESL_SQ       *b   = new_sq(abc);
+  TBUF          tb  = { NULL, 0, 0 };
+  char          file[300];
+  TCX           t   = { NULL, "map change", 0 };
+  ESL_SQFILE   *A, *B;
+  ESL_DSQ       codeA = abc->inmap['A'];
+  ESL_DSQ       codeC = abc->inmap['C'];
+  int           i, j, k, L, sa, sb;
+
+  for (i = 0; i < 10; i++)
+    {
+      tb.n = 0;
+      for (j = 0; j < 6; j++)
+        {
+          char hdr[32];
+          snprintf(hdr, 32, ">seq%d\n", j);
+          tb_puts(&tb, hdr);
+          L = rlen(rng, 200);
+          for (k = 0; k < L; k++)
+            {
+              tb_putc(&tb, pick(rng, "AAAACDEFGHIKLMNPQRSTVWY"));
+              if ((k + 1) % 60 == 0) tb_putc(&tb, '\n');
+            }
+          tb_putc(&tb, '\n');
+        }
+      write_tmpfile(&tb, file);
+      t.file  = file;
+      t.ncall = 0;
+      sqascii_readsize = (i % 2 ? SQASCII_FILE_READSIZE : 1 + esl_rnd_Roll(rng, 64));
+      if (open_pair(&t, file, eslSQFILE_FASTA, abc, &A, &B) != eslOK) esl_fatal("map change test: can't open %s", file);
+      for (j = 0; ; j++)
+        {
+          if (j == 2) abc->inmap['A'] = codeC;
+          if (j == 4) abc->inmap['A'] = codeA;
+          sa = esl_sqio_Read(A, a);
+          sb = esl_sqio_Read(B, b);
+          t.ncall++;
+          cmp_status(&t, A, B, sa, sb);
+          if (sa != eslOK) break;
+          cmp_sq(&t, a, b);
+          esl_sq_Reuse(a);
+          esl_sq_Reuse(b);
+        }
+      abc->inmap['A'] = codeA;
+      esl_sqfile_Close(A);
+      esl_sqfile_Close(B);
+      remove(file);
+    }
+  sqascii_readsize = SQASCII_FILE_READSIZE;
+  free(tb.s);
+  esl_sq_Destroy(a);
+  esl_sq_Destroy(b);
+  esl_alphabet_Destroy(abc);
+}
+
 /* gzip_copy(): <file>.gz next to <file>; FALSE if gzip isn't available */
 static int
 gzip_copy(const char *file, char *gzfile)
@@ -4737,6 +4843,7 @@ main(int argc, char **argv)
 
   utest_edgecases(rng, abc);
   utest_mismatched_alphabet(rng);
+  utest_map_change(rng);
 
   /* Random files: FASTA (messy and clean), hmmpgmd, EMBL, GenBank; each
    * read by every test at the default read size and at a random other
