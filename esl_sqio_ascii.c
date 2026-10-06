@@ -3200,12 +3200,20 @@ header_run(ESL_SQFILE *sqfp, int cls, char *c, char **dst, int *pos, int *alloc,
   ESL_SQASCII_DATA *ascii  = &sqfp->data.ascii;
   int               status = eslOK;
   int               start, bpos, len;
+  char             *p;
   void             *tmp;
 
   while (status == eslOK && header_in(cls, *c))
     {
       start = ascii->bpos;
-      for (bpos = start + 1; bpos < ascii->nc && header_in(cls, ascii->buf[bpos]); bpos++) ;
+      if (cls == HDR_DESC || cls == HDR_TOEOL)
+        { /* the run ends at the first \n, \r (or ^A) after <start>: memchr() is much faster than a loop on long lines */
+          bpos = (p = memchr(ascii->buf + start + 1, '\n', ascii->nc - start - 1)) ? p - ascii->buf : ascii->nc;
+          if ((p = memchr(ascii->buf + start + 1, '\r', bpos - start - 1)))                   bpos = p - ascii->buf;
+          if (cls == HDR_DESC && (p = memchr(ascii->buf + start + 1, 1, bpos - start - 1)))   bpos = p - ascii->buf;
+        }
+      else
+        for (bpos = start + 1; bpos < ascii->nc && header_in(cls, ascii->buf[bpos]); bpos++) ;
       if (dst)
         {
           len = bpos - start;
